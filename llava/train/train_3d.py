@@ -263,7 +263,10 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler"]
+    # jepa_projector is full-tuned (not a LoRA target). Also its Sequential's
+    # numeric index names ("0", "2") would otherwise pollute target_modules and
+    # accidentally match Qwen2DecoderLayer (model.layers.0, .1, ...).
+    multimodal_keywords = ["mm_projector", "vision_tower", "vision_resampler", "jepa_projector"]
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -273,7 +276,9 @@ def find_all_linear_names(model):
 
     if "lm_head" in lora_module_names:  # needed for 16-bit
         lora_module_names.remove("lm_head")
-    
+    # Defensive: drop any numeric-only names that could match decoder layer indices.
+    lora_module_names = {n for n in lora_module_names if not n.isdigit()}
+
     rank0_print("lora_module_names", lora_module_names)
     return list(lora_module_names)
 
