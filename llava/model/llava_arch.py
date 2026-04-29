@@ -89,12 +89,9 @@ class LlavaMetaModel:
             # elif "slp" in self.config.world_position_embedding_type:
             #     self.world_position_embedding = PositionEmbeddingSine3DMLP(config.hidden_size, n_points=n_points)
 
-            # Eager init of the JEPA projector when JEPA-only mode is enabled.
-            # Eager (rather than lazy) because PEFT freezes everything at wrap time,
-            # the optimizer is built from named_parameters, and DeepSpeed ZeRO-3
-            # partitions parameters at construction. Lazy init breaks all three.
-            if getattr(self.config, "use_jepa_only", False):
-                self.jepa_projector = JEPAProjector(config.hidden_size)
+            # NOTE: jepa_projector is now created in LlavaQwenForCausalLM.__init__
+            # (alongside ground_head) to avoid silent skip when this branch
+            # isn't reached due to init ordering or missing world_position_embedding_type.
 
 
     def get_vision_tower(self):

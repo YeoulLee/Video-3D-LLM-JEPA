@@ -1807,7 +1807,12 @@ def train(attn_implementation=None):
                         break
             rank0_print(f"[unfreeze] LoRA-mode unfrozen counts: {unfreeze_counts}")
             if model_args.use_jepa_only and unfreeze_counts["jepa_projector"] == 0:
-                rank0_print("[unfreeze] WARNING: use_jepa_only=True but no jepa_projector params found — config did not propagate to LlavaMetaModel.__init__")
+                raise RuntimeError(
+                    "use_jepa_only=True but no jepa_projector params found in model. "
+                    "Aborting to prevent training an empty checkpoint. "
+                    "Check LlavaQwenForCausalLM.__init__ — jepa_projector should be "
+                    "created there when config.use_jepa_only is True."
+                )
         else:
             if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
                 model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter

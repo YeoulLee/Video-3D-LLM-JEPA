@@ -54,6 +54,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         self.model = LlavaQwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # JEPA projector — created here (alongside ground_head) instead of inside
+        # LlavaMetaModel.__init__ so it is unconditionally instantiated whenever
+        # use_jepa_only=True, independent of world_position_embedding_type
+        # presence and Qwen2Model init ordering.
+        if getattr(config, "use_jepa_only", False):
+            from llava.model.llava_arch import JEPAProjector
+            self.model.jepa_projector = JEPAProjector(config.hidden_size)
+            print(f"[JEPA] LlavaQwenForCausalLM.__init__: jepa_projector created (hidden={config.hidden_size})")
+
         if hasattr(config, "ground_head_type") and config.ground_head_type is not None:
             self.ground_head_type = config.ground_head_type
             if config.ground_head_type == "mlp":

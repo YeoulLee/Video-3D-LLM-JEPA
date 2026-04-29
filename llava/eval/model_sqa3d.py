@@ -240,8 +240,14 @@ def eval_model(questions, args):
             )
 
         
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        outputs = outputs.strip()
+        # HF generate() returns the full sequence (input + new tokens). Slice off the
+        # input prefix before decoding; otherwise skip_special_tokens leaves literal
+        # role text like "assistant\n" in the prediction (the chat-template tokens
+        # <|im_start|>/<|im_end|> are stripped, but "assistant" / "\n" are not).
+        input_token_len = input_ids.shape[1]
+        outputs = tokenizer.batch_decode(
+            output_ids[:, input_token_len:], skip_special_tokens=True
+        )[0].strip()
         if outputs.endswith(stop_str):
             outputs = outputs[:-len(stop_str)]
         outputs = outputs.strip()
