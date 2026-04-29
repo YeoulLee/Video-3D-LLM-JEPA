@@ -177,6 +177,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
+    embed_tokens_lr: Optional[float] = None
     group_by_task_length: bool = field(default=False)
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
@@ -1681,6 +1682,7 @@ def train(attn_implementation=None):
                 def __init__(self, hidden_size, point_dim=256):
                     super().__init__()
                     self.point_proj = _nn.Sequential(
+                        _nn.LayerNorm(point_dim),
                         _nn.Linear(point_dim, hidden_size),
                         _nn.GELU(),
                         _nn.Linear(hidden_size, hidden_size),
@@ -1840,9 +1842,12 @@ def train(attn_implementation=None):
 
         ### Deciding train which part of the model
         if training_args.lora_enable:
-            # We update embed_tokens as the size of embedding has changed.
+            # embed_tokens is intentionally NOT unfrozen: SQA3D data never uses the
+            # newly-added <coord>/<ground> tokens (verified by grep on the training
+            # set), so the new rows have zero learning signal and full-tuning the
+            # ~550M embedding matrix only destabilizes the pretrained representation.
             # jepa_projector is fully fine-tuned in LoRA mode (it is not a LoRA target).
-            unfreeze_counts = {"embed_tokens": 0, "lora_": 0, "jepa_projector": 0}
+            unfreeze_counts = {"lora_": 0, "jepa_projector": 0}
             for name, param in model.named_parameters():
                 for tag in unfreeze_counts:
                     if tag in name:

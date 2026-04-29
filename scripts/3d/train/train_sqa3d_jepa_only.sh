@@ -84,7 +84,7 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --add_spatial_instruction True \
     --force_sample True \
     --mm_spatial_pool_stride 2 \
-    --world_position_embedding_type avg-discrete-sin3d \
+    --world_position_embedding_type avg-sin3d \
     --object_feature_type patch14-pe \
     --ground_head_type infonce \
     --group_by_task_length True \

@@ -46,7 +46,10 @@ class JEPAProjector(nn.Module):
 
     def __init__(self, hidden_size, point_dim=256):
         super().__init__()
+        # LayerNorm on the input stabilizes training when JEPA feature scale is
+        # uneven across scenes — the first Linear+GELU otherwise saturates.
         self.point_proj = nn.Sequential(
+            nn.LayerNorm(point_dim),
             nn.Linear(point_dim, hidden_size),
             nn.GELU(),
             nn.Linear(hidden_size, hidden_size),

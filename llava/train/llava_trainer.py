@@ -463,6 +463,11 @@ class LLaVATrainer(Trainer):
                 lr_mapper["mm_projector"] = self.args.mm_projector_lr
             if self.args.mm_vision_tower_lr is not None:
                 lr_mapper["vision_tower"] = self.args.mm_vision_tower_lr
+            # embed_tokens is full-tuned to learn a tiny number of new special-token
+            # rows; the bulk of the matrix should stay near pretrained — use a low lr.
+            embed_tokens_lr = getattr(self.args, "embed_tokens_lr", None)
+            if embed_tokens_lr is not None:
+                lr_mapper["embed_tokens"] = embed_tokens_lr
             if len(lr_mapper) > 0:
                 special_lr_parameters = [name for name, _ in opt_model.named_parameters() if any(module_keyword in name for module_keyword in lr_mapper)]
                 optimizer_grouped_parameters = [

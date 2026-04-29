@@ -69,6 +69,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 def __init__(self, hidden_size, point_dim=256):
                     super().__init__()
                     self.point_proj = _nn.Sequential(
+                        _nn.LayerNorm(point_dim),
                         _nn.Linear(point_dim, hidden_size),
                         _nn.GELU(),
                         _nn.Linear(hidden_size, hidden_size),
