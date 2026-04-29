@@ -1667,9 +1667,23 @@ def train(attn_implementation=None):
         existing_jepa = [n for n, _ in model.named_parameters() if "jepa_projector" in n]
         rank0_print(f"[JEPA-train] post-load existing jepa params: {len(existing_jepa)} ({existing_jepa[:2]})")
         if not existing_jepa:
-            from llava.model.llava_arch import JEPAProjector
+            # Inline definition to avoid sys.modules partial-load issues when
+            # other LlavaXXX models in llava/model/__init__.py fail to import
+            # (which leaves llava.model.llava_arch in a partially-initialized
+            # state, breaking later `from ... import JEPAProjector`).
+            import torch.nn as _nn
+            class _JEPAProjectorInline(_nn.Module):
+                def __init__(self, hidden_size, point_dim=256):
+                    super().__init__()
+                    self.point_proj = _nn.Sequential(
+                        _nn.Linear(point_dim, hidden_size),
+                        _nn.GELU(),
+                        _nn.Linear(hidden_size, hidden_size),
+                    )
+                def forward(self, x):
+                    return self.point_proj(x)
             inner = model.get_model()  # the LlavaQwenModel
-            inner.jepa_projector = JEPAProjector(model.config.hidden_size)
+            inner.jepa_projector = _JEPAProjectorInline(model.config.hidden_size)
             # match dtype / device of an existing param so it lands on the right rank
             ref_param = next(iter(inner.embed_tokens.parameters()))
             inner.jepa_projector.to(dtype=ref_param.dtype, device=ref_param.device)

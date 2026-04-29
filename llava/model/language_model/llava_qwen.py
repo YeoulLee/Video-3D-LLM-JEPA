@@ -61,8 +61,21 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         _use_jepa = getattr(config, "use_jepa_only", False)
         print(f"[JEPA-debug] LlavaQwenForCausalLM.__init__ entered. config.use_jepa_only={_use_jepa} (id(config)={id(config)})")
         if _use_jepa:
-            from llava.model.llava_arch import JEPAProjector
-            self.model.jepa_projector = JEPAProjector(config.hidden_size)
+            # Inline to avoid sys.modules partial-load races (other LlavaXXX
+            # models in llava.model.__init__ can leave llava_arch partially
+            # loaded when their import chain fails).
+            import torch.nn as _nn
+            class _JEPAProjectorInline(_nn.Module):
+                def __init__(self, hidden_size, point_dim=256):
+                    super().__init__()
+                    self.point_proj = _nn.Sequential(
+                        _nn.Linear(point_dim, hidden_size),
+                        _nn.GELU(),
+                        _nn.Linear(hidden_size, hidden_size),
+                    )
+                def forward(self, x):
+                    return self.point_proj(x)
+            self.model.jepa_projector = _JEPAProjectorInline(config.hidden_size)
             # Sanity verify the params actually registered on self.model
             jepa_param_names = [n for n, _ in self.model.named_parameters() if "jepa_projector" in n]
             print(f"[JEPA] jepa_projector created (hidden={config.hidden_size}); registered params: {jepa_param_names}")
