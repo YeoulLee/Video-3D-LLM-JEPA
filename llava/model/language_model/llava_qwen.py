@@ -58,10 +58,14 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # LlavaMetaModel.__init__ so it is unconditionally instantiated whenever
         # use_jepa_only=True, independent of world_position_embedding_type
         # presence and Qwen2Model init ordering.
-        if getattr(config, "use_jepa_only", False):
+        _use_jepa = getattr(config, "use_jepa_only", False)
+        print(f"[JEPA-debug] LlavaQwenForCausalLM.__init__ entered. config.use_jepa_only={_use_jepa} (id(config)={id(config)})")
+        if _use_jepa:
             from llava.model.llava_arch import JEPAProjector
             self.model.jepa_projector = JEPAProjector(config.hidden_size)
-            print(f"[JEPA] LlavaQwenForCausalLM.__init__: jepa_projector created (hidden={config.hidden_size})")
+            # Sanity verify the params actually registered on self.model
+            jepa_param_names = [n for n, _ in self.model.named_parameters() if "jepa_projector" in n]
+            print(f"[JEPA] jepa_projector created (hidden={config.hidden_size}); registered params: {jepa_param_names}")
 
         if hasattr(config, "ground_head_type") and config.ground_head_type is not None:
             self.ground_head_type = config.ground_head_type

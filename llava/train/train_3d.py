@@ -1657,6 +1657,31 @@ def train(attn_implementation=None):
             "type": model_args.rope_scaling_type,
         }
 
+    # ─── JEPA-only: ensure jepa_projector exists BEFORE PEFT wrap / freezing ───
+    # Robust safety net: regardless of whether the LlavaQwenForCausalLM.__init__
+    # block fired (it can be skipped under DeepSpeed ZeRO-3 zero.Init() in some
+    # versions, or if the config attr was lost), force-create the projector here.
+    if model_args.use_jepa_only:
+        # Make sure the live model.config also reflects use_jepa_only (for save).
+        setattr(model.config, "use_jepa_only", True)
+        existing_jepa = [n for n, _ in model.named_parameters() if "jepa_projector" in n]
+        rank0_print(f"[JEPA-train] post-load existing jepa params: {len(existing_jepa)} ({existing_jepa[:2]})")
+        if not existing_jepa:
+            from llava.model.llava_arch import JEPAProjector
+            inner = model.get_model()  # the LlavaQwenModel
+            inner.jepa_projector = JEPAProjector(model.config.hidden_size)
+            # match dtype / device of an existing param so it lands on the right rank
+            ref_param = next(iter(inner.embed_tokens.parameters()))
+            inner.jepa_projector.to(dtype=ref_param.dtype, device=ref_param.device)
+            after = [n for n, _ in model.named_parameters() if "jepa_projector" in n]
+            rank0_print(f"[JEPA-train] force-created jepa_projector. params now: {after}")
+            if not after:
+                raise RuntimeError(
+                    "jepa_projector was attached to model but does not appear in "
+                    "named_parameters(). Likely DeepSpeed ZeRO-3 partition issue — "
+                    "create the module BEFORE deepspeed.zero.Init() context."
+                )
+
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
