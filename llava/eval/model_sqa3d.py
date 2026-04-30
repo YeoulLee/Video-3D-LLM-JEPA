@@ -16,6 +16,7 @@ from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
 from llava.video_utils import VideoProcessor, merge_video_dict
+from llava.utils_3d import downsample_jepa
 
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from typing import Dict, Optional, Sequence, List
@@ -215,13 +216,15 @@ def eval_model(questions, args):
                 if os.path.exists(jepa_path):
                     jepa_data = torch.load(jepa_path, map_location="cpu")
                     if isinstance(jepa_data, dict):
-                        video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
-                        video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
+                        feats = jepa_data.get("features", jepa_data.get("jepa_features"))
+                        crds = jepa_data.get("coords", jepa_data.get("points"))
                     elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
-                        video_dict["jepa_features"] = jepa_data[0]
-                        video_dict["jepa_coords"] = jepa_data[1]
+                        feats, crds = jepa_data[0], jepa_data[1]
                     else:
                         raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
+                    feats, crds = downsample_jepa(feats, crds, args.jepa_max_tokens)
+                    video_dict["jepa_features"] = feats
+                    video_dict["jepa_coords"] = crds
                 elif getattr(model.config, "use_jepa_only", False):
                     # JEPA-only mode has no fallback visual signal — record an empty prediction and skip.
                     print(f"[skip] JEPA-only run but JEPA features missing for {video_id} ({jepa_path}); writing empty prediction.")
@@ -348,6 +351,8 @@ if __name__ == "__main__":
     parser.add_argument("--lora-path", type=str, default=None)
     parser.add_argument("--jepa-feature-folder", type=str, default=None,
                         help="Folder of pre-extracted 3D-JEPA features (one .pt per scene). Required if the trained ckpt was use_jepa_only=True.")
+    parser.add_argument("--jepa_max_tokens", type=int, default=4096,
+                        help="Cap on JEPA visual tokens per sample to keep the prompt + visuals + max_new_tokens well under tokenizer_model_max_length (32K). 102K raw points get truncated, lopping off the assistant marker.")
     args = parser.parse_args()
 
     # Data

@@ -46,6 +46,7 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token, resize_and_center_crop
 from llava.video_utils import VideoProcessor, merge_video_dict
+from llava.utils_3d import downsample_jepa
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -152,6 +153,7 @@ class DataArguments:
     frame_sampling_strategy: str = 'uniform' # uniform, mc32, mc24
 
     jepa_feature_folder: Optional[str] = field(default=None, metadata={"help": "Folder of pre-extracted 3D-JEPA features (one .pt file per scene). Required when --use_jepa_only is set."})
+    jepa_max_tokens: int = field(default=4096, metadata={"help": "Cap on JEPA visual tokens per sample. Raw 3D-JEPA features can have ~100k points/scene; without capping the prompt + visuals exceed tokenizer_model_max_length (32K) and the answer labels get truncated, killing the training signal."})
 
 
 @dataclass
@@ -1285,13 +1287,15 @@ class LazySupervisedDataset(Dataset):
                     jepa_path = os.path.join(self.data_args.jepa_feature_folder, scene_id) + ".pt"
                     jepa_data = torch.load(jepa_path, map_location="cpu")
                     if isinstance(jepa_data, dict):
-                        video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
-                        video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
+                        feats = jepa_data.get("features", jepa_data.get("jepa_features"))
+                        crds = jepa_data.get("coords", jepa_data.get("points"))
                     elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
-                        video_dict["jepa_features"] = jepa_data[0]
-                        video_dict["jepa_coords"] = jepa_data[1]
+                        feats, crds = jepa_data[0], jepa_data[1]
                     else:
                         raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
+                    feats, crds = downsample_jepa(feats, crds, self.data_args.jepa_max_tokens)
+                    video_dict["jepa_features"] = feats
+                    video_dict["jepa_coords"] = crds
 
                 image = video_dict.pop("images")
                 video_size = video_dict.pop("video_size")
