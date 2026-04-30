@@ -468,6 +468,11 @@ class LLaVATrainer(Trainer):
             embed_tokens_lr = getattr(self.args, "embed_tokens_lr", None)
             if embed_tokens_lr is not None:
                 lr_mapper["embed_tokens"] = embed_tokens_lr
+            # jepa_projector starts from random init and must catch up fast,
+            # otherwise the LM learns to ignore visual tokens (text-only collapse).
+            jepa_projector_lr = getattr(self.args, "jepa_projector_lr", None)
+            if jepa_projector_lr is not None:
+                lr_mapper["jepa_projector"] = jepa_projector_lr
             if len(lr_mapper) > 0:
                 special_lr_parameters = [name for name, _ in opt_model.named_parameters() if any(module_keyword in name for module_keyword in lr_mapper)]
                 optimizer_grouped_parameters = [

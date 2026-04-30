@@ -68,6 +68,7 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --save_steps 500 \
     --save_total_limit 3 \
     --learning_rate 1e-4 \
+    --jepa_projector_lr 1e-3 \
     --weight_decay 0. \
     --warmup_ratio 0.05 \
     --lr_scheduler_type "cosine" \

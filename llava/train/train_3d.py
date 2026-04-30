@@ -180,6 +180,7 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
     embed_tokens_lr: Optional[float] = None
+    jepa_projector_lr: Optional[float] = None
     group_by_task_length: bool = field(default=False)
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
