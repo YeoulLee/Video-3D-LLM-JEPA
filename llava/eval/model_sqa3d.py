@@ -116,16 +116,24 @@ def eval_model(questions, args):
         model = model.merge_and_unload()
 
         # non_lora_trainables.bin was saved while the model was PEFT-wrapped, so
-        # keys start with "base_model.". Strip that single prefix to match the
-        # post-merge module tree, then cast to model dtype (bf16-trained).
+        # keys carry the full PEFT prefix "base_model.model.". After merge_and_unload
+        # the live model is back to its raw module tree, so we strip that 17-char
+        # prefix to make keys match. Cast to model dtype (bf16-trained).
+        PEFT_PREFIX = "base_model.model."
         state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
-        state_dict = {(k[len("base_model."):] if k.startswith("base_model.") else k): v for k, v in state_dict.items()}
+        state_dict = {(k[len(PEFT_PREFIX):] if k.startswith(PEFT_PREFIX) else k): v for k, v in state_dict.items()}
         state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
         print(f"[non_lora_trainables] loaded {len(state_dict)} tensors; "
               f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
         if msg.unexpected_keys:
-            print(f"  first unexpected: {msg.unexpected_keys[:5]}")
+            # If this is non-empty after the strip, the PEFT prefix didn't match —
+            # likely a save-time format change. Surface it loudly.
+            raise RuntimeError(
+                f"[non_lora_trainables] {len(msg.unexpected_keys)} keys did not match the model "
+                f"after stripping '{PEFT_PREFIX}'. First few: {msg.unexpected_keys[:5]}. "
+                f"Trained weights would be silently ignored — aborting."
+            )
 
     # Sanity check: if the trained ckpt expects JEPA features, the user must provide them.
     if getattr(model.config, "use_jepa_only", False) and args.jepa_feature_folder is None:
