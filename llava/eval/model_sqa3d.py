@@ -112,30 +112,20 @@ def eval_model(questions, args):
         tokenizer = AutoTokenizer.from_pretrained(args.lora_path)
         model.resize_token_embeddings(len(tokenizer))
 
-        # Load non_lora_trainables BEFORE wrapping with PEFT, so the live model's
-        # parameter paths are simple (no "base_model.model." prefix). This matches
-        # builder.py's LoRA loading branch and avoids prefix-stripping bugs.
-        state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
-        # PEFT wrap during training prepends "base_model.model." to keys; strip that here.
-        state_dict = {(k[len("base_model."):] if k.startswith("base_model.") else k): v for k, v in state_dict.items()}
-        if any(k.startswith("model.model.") for k in state_dict):
-            state_dict = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in state_dict.items()}
-        # Cast to model dtype so bf16-trained tensors land cleanly.
-        state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
-        msg = model.load_state_dict(state_dict, strict=False)
-        # embed_tokens is intentionally frozen during training (SQA3D never uses
-        # the new <coord>/<ground> tokens), so it lives in the base model's
-        # pretrained weights — not expected in non_lora_trainables.bin.
-        critical_missing = [k for k in msg.missing_keys if any(s in k for s in ("jepa_projector", "world_position_embedding", "ground_head"))]
-        if msg.unexpected_keys:
-            print(f"[non_lora_trainables] unexpected ({len(msg.unexpected_keys)}): {msg.unexpected_keys[:5]}{' ...' if len(msg.unexpected_keys) > 5 else ''}")
-        if critical_missing:
-            print(f"[non_lora_trainables] WARNING - critical missing ({len(critical_missing)}): {critical_missing[:10]}")
-        else:
-            print(f"[non_lora_trainables] all critical modules loaded; {len(msg.missing_keys)} other missing keys.")
-
         model = PeftModel.from_pretrained(model, args.lora_path, adapter_name="lora")
         model = model.merge_and_unload()
+
+        # non_lora_trainables.bin was saved while the model was PEFT-wrapped, so
+        # keys start with "base_model.". Strip that single prefix to match the
+        # post-merge module tree, then cast to model dtype (bf16-trained).
+        state_dict = torch.load(os.path.join(args.lora_path, 'non_lora_trainables.bin'), map_location="cpu")
+        state_dict = {(k[len("base_model."):] if k.startswith("base_model.") else k): v for k, v in state_dict.items()}
+        state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
+        msg = model.load_state_dict(state_dict, strict=False)
+        print(f"[non_lora_trainables] loaded {len(state_dict)} tensors; "
+              f"missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
+        if msg.unexpected_keys:
+            print(f"  first unexpected: {msg.unexpected_keys[:5]}")
 
     # Sanity check: if the trained ckpt expects JEPA features, the user must provide them.
     if getattr(model.config, "use_jepa_only", False) and args.jepa_feature_folder is None:

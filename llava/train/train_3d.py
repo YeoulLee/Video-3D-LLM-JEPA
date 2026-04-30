@@ -1840,81 +1840,86 @@ def train(attn_implementation=None):
         model.config.force_sample = data_args.force_sample
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
-        ### Deciding train which part of the model
-        if training_args.lora_enable:
-            # embed_tokens is intentionally NOT unfrozen: SQA3D data never uses the
-            # newly-added <coord>/<ground> tokens (verified by grep on the training
-            # set), so the new rows have zero learning signal and full-tuning the
-            # ~550M embedding matrix only destabilizes the pretrained representation.
-            # jepa_projector is fully fine-tuned in LoRA mode (it is not a LoRA target).
-            unfreeze_counts = {"lora_": 0, "jepa_projector": 0}
-            for name, param in model.named_parameters():
-                for tag in unfreeze_counts:
-                    if tag in name:
+        ### Deciding train which part of the model (upstream Video-3D-LLM dispatcher)
+        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+            model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+            model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
+            if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
+                model.requires_grad_(False)
+            if model_args.tune_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if model_args.tune_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
+
+            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+            if training_args.freeze_mm_mlp_adapter:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = False
+
+            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+            if training_args.freeze_mm_vision_resampler:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = False
+
+            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+            if model_args.unfreeze_mm_vision_tower:
+                vision_tower.requires_grad_(True)
+            else:
+                vision_tower.requires_grad_(False)
+
+        else:
+            rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
+            model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
+            # Set the entire model to not require gradients by default
+            model.requires_grad_(False)
+            vision_tower.requires_grad_(False)
+            model.get_model().mm_projector.requires_grad_(False)
+            model.get_model().vision_resampler.requires_grad_(False)
+            # Parse the mm_tunable_parts to decide which parts to unfreeze
+            tunable_parts = model_args.mm_tunable_parts.split(",")
+            if "mm_mlp_adapter" in tunable_parts:
+                for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if "mm_vision_resampler" in tunable_parts:
+                for p in model.get_model().vision_resampler.parameters():
+                    p.requires_grad = True
+            if "mm_vision_tower" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" in name:
                         param.requires_grad_(True)
-                        unfreeze_counts[tag] += 1
-                        break
-            rank0_print(f"[unfreeze] LoRA-mode unfrozen counts: {unfreeze_counts}")
-            if model_args.use_jepa_only and unfreeze_counts["jepa_projector"] == 0:
+            if "mm_language_model" in tunable_parts:
+                for name, param in model.named_parameters():
+                    if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
+                        param.requires_grad_(True)
+
+        # Under PEFT wrap, model.requires_grad_(False) above also freezes the LoRA
+        # adapters. Re-enable them so the LoRA path actually trains. Also covers the
+        # mm_tunable_parts=None / non-mm_language_model cases where the dispatcher
+        # would not touch lora_* params at all.
+        if training_args.lora_enable:
+            lora_unfrozen = 0
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad_(True)
+                    lora_unfrozen += 1
+            rank0_print(f"[unfreeze] re-enabled {lora_unfrozen} LoRA adapter params after dispatcher.")
+
+        # JEPA projector is always trained when use_jepa_only — it is not a LoRA
+        # target and may be missed by the dispatcher's substring filters.
+        if model_args.use_jepa_only:
+            jepa_unfrozen = 0
+            for name, param in model.named_parameters():
+                if "jepa_projector" in name:
+                    param.requires_grad_(True)
+                    jepa_unfrozen += 1
+            rank0_print(f"[unfreeze] jepa_projector params unfrozen: {jepa_unfrozen}")
+            if jepa_unfrozen == 0:
                 raise RuntimeError(
                     "use_jepa_only=True but no jepa_projector params found in model. "
-                    "Aborting to prevent training an empty checkpoint. "
-                    "Check LlavaQwenForCausalLM.__init__ — jepa_projector should be "
-                    "created there when config.use_jepa_only is True."
+                    "Aborting to prevent training an empty checkpoint."
                 )
-        else:
-            if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
-                model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-                model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
-                if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
-                    model.requires_grad_(False)
-                if model_args.tune_mm_mlp_adapter:
-                    for p in model.get_model().mm_projector.parameters():
-                        p.requires_grad = True
-                if model_args.tune_mm_vision_resampler:
-                    for p in model.get_model().vision_resampler.parameters():
-                        p.requires_grad = True
-
-                model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
-                if training_args.freeze_mm_mlp_adapter:
-                    for p in model.get_model().mm_projector.parameters():
-                        p.requires_grad = False
-
-                model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
-                if training_args.freeze_mm_vision_resampler:
-                    for p in model.get_model().vision_resampler.parameters():
-                        p.requires_grad = False
-
-                model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
-                if model_args.unfreeze_mm_vision_tower:
-                    vision_tower.requires_grad_(True)
-                else:
-                    vision_tower.requires_grad_(False)
-
-            else:
-                rank0_print(f"Using mm_tunable_parts: {model_args.mm_tunable_parts}")
-                model.config.mm_tunable_parts = training_args.mm_tunable_parts = model_args.mm_tunable_parts
-                # Set the entire model to not require gradients by default
-                model.requires_grad_(False)
-                vision_tower.requires_grad_(False)
-                model.get_model().mm_projector.requires_grad_(False)
-                model.get_model().vision_resampler.requires_grad_(False)
-                # Parse the mm_tunable_parts to decide which parts to unfreeze
-                tunable_parts = model_args.mm_tunable_parts.split(",")
-                if "mm_mlp_adapter" in tunable_parts:
-                    for p in model.get_model().mm_projector.parameters():
-                        p.requires_grad = True
-                if "mm_vision_resampler" in tunable_parts:
-                    for p in model.get_model().vision_resampler.parameters():
-                        p.requires_grad = True
-                if "mm_vision_tower" in tunable_parts:
-                    for name, param in model.named_parameters():
-                        if "vision_tower" in name:
-                            param.requires_grad_(True)
-                if "mm_language_model" in tunable_parts:
-                    for name, param in model.named_parameters():
-                        if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-                            param.requires_grad_(True)
 
         if model_args.world_position_embedding_type is not None:
             for name, param in model.named_parameters():
