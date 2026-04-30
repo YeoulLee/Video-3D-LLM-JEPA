@@ -479,6 +479,20 @@ class LlavaMetaForCausalLM(ABC):
             target_dtype = projector.point_proj[0].weight.dtype
             projected = projector(jepa_features.to(target_dtype))   # (B, N, hidden)
 
+            # One-shot sanity check on first batch: dead inputs (all-zero / NaN)
+            # would let training run silently with no visual signal. Print stats
+            # once, then disable.
+            if not getattr(self, "_jepa_sanity_logged", False):
+                with torch.no_grad():
+                    f = jepa_features.float()
+                    p = projected.float()
+                    print(f"[JEPA-sanity] features shape={tuple(jepa_features.shape)} "
+                          f"abs_mean={f.abs().mean().item():.4g} std={f.std().item():.4g} "
+                          f"any_nan={torch.isnan(f).any().item()}  ||  "
+                          f"projected abs_mean={p.abs().mean().item():.4g} std={p.std().item():.4g} "
+                          f"any_nan={torch.isnan(p).any().item()}")
+                self._jepa_sanity_logged = True
+
             if wpe_module is not None:
                 # Re-use the same sin3d coord encoder as the SigLIP path so the spatial
                 # representation stays consistent. Discretize coordinates first if the
@@ -860,6 +874,19 @@ class LlavaMetaForCausalLM(ABC):
         
         if use_mrope_position_embedding:
             position_ids = mrope_position_ids
+
+        # One-shot label coverage check: if labels are all IGNORE_INDEX, the loss
+        # has no supervision signal and training is silently a no-op. The previous
+        # JEPA token-bloat bug had exactly this failure mode (answer labels lay
+        # past the 32K truncation cutoff). Print once on the first batch.
+        if new_labels is not None and not getattr(self, "_label_sanity_logged", False):
+            with torch.no_grad():
+                _seq_len = new_labels.shape[1]
+                _per_sample = (new_labels != IGNORE_INDEX).sum(dim=1).tolist()
+                _total = sum(_per_sample)
+                print(f"[label-sanity] seq_len={_seq_len}  non_ignore_per_sample={_per_sample}  "
+                      f"total={_total}  (must be > 0; else loss has no supervision)")
+            self._label_sanity_logged = True
 
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")

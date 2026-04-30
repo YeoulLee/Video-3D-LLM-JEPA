@@ -42,12 +42,12 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --video_folder $VIDEO_FOLDER \
     --embodiedscan_folder data/embodiedscan/ \
     --jepa_feature_folder $JEPA_FEATURE_FOLDER \
+    --jepa_max_tokens 4096 \
     --use_jepa_only True \
     --lora_enable True \
     --lora_r 128 \
     --lora_alpha 256 \
     --lora_dropout 0.05 \
-    --mm_tunable_parts="mm_language_model" \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
@@ -86,7 +86,6 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --mm_spatial_pool_stride 2 \
     --world_position_embedding_type avg-sin3d \
     --object_feature_type patch14-pe \
-    --ground_head_type infonce \
     --group_by_task_length True \
     --frame_sampling_strategy uniform \
     --frames_upbound 32 \

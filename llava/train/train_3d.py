@@ -1942,7 +1942,14 @@ def train(attn_implementation=None):
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
         rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
-        # rank0_print('trainable params', [n for n, p in model.named_parameters() if p.requires_grad])
+        _trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        rank0_print(f"trainable params ({len(_trainable_names)}): "
+                    f"first 10 = {_trainable_names[:10]}; "
+                    f"last 5 = {_trainable_names[-5:]}; "
+                    f"jepa_projector matches = {sum('jepa_projector' in n for n in _trainable_names)}; "
+                    f"ground_head matches = {sum('ground_head' in n for n in _trainable_names)}; "
+                    f"world_position_embedding matches = {sum('world_position_embedding' in n for n in _trainable_names)}; "
+                    f"lora_ matches = {sum('lora_' in n for n in _trainable_names)}")
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
