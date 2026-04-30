@@ -74,6 +74,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                         _nn.GELU(),
                         _nn.Linear(hidden_size, hidden_size),
                     )
+                    # Zero-init the last Linear so the projector outputs 0 at the
+                    # very start of training. This breaks the cold-start deadlock
+                    # where LoRA learns to ignore visual tokens before the
+                    # projector ever converges to useful representations: with
+                    # zero output the LM behaves text-only at step 0, and the
+                    # projector then has to climb up from 0 — gradient flows
+                    # cleanly without LoRA having pre-decided to ignore noise.
+                    _nn.init.zeros_(self.point_proj[3].weight)
+                    _nn.init.zeros_(self.point_proj[3].bias)
                 def forward(self, x):
                     return self.point_proj(x)
             self.model.jepa_projector = _JEPAProjectorInline(config.hidden_size)

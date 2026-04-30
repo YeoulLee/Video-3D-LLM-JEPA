@@ -1692,6 +1692,12 @@ def train(attn_implementation=None):
                         _nn.GELU(),
                         _nn.Linear(hidden_size, hidden_size),
                     )
+                    # Zero-init last Linear — see llava_qwen.py for full rationale.
+                    # Mirrored here because this is the train-time backup path
+                    # used when LlavaQwenForCausalLM.__init__ didn't create the
+                    # projector (rare DeepSpeed edge case).
+                    _nn.init.zeros_(self.point_proj[3].weight)
+                    _nn.init.zeros_(self.point_proj[3].bias)
                 def forward(self, x):
                     return self.point_proj(x)
             inner = model.get_model()  # the LlavaQwenModel
