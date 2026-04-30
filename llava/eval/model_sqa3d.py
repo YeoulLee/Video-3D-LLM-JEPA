@@ -223,6 +223,11 @@ def eval_model(questions, args):
                     else:
                         raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
                     feats, crds = downsample_jepa(feats, crds, args.jepa_max_tokens)
+                    if args.zero_jepa_features:
+                        # Visual ablation: keep shape (so prompt structure / token count is
+                        # unchanged) but zero the values. Accuracy gap vs the normal run
+                        # measures the model's actual reliance on JEPA visual signal.
+                        feats = torch.zeros_like(feats)
                     video_dict["jepa_features"] = feats
                     video_dict["jepa_coords"] = crds
                 elif getattr(model.config, "use_jepa_only", False):
@@ -353,6 +358,8 @@ if __name__ == "__main__":
                         help="Folder of pre-extracted 3D-JEPA features (one .pt per scene). Required if the trained ckpt was use_jepa_only=True.")
     parser.add_argument("--jepa_max_tokens", type=int, default=4096,
                         help="Cap on JEPA visual tokens per sample to keep the prompt + visuals + max_new_tokens well under tokenizer_model_max_length (32K). 102K raw points get truncated, lopping off the assistant marker.")
+    parser.add_argument("--zero_jepa_features", action="store_true",
+                        help="Visual ablation: replace JEPA feature values with zeros (shape preserved). Accuracy gap vs normal run = model's reliance on visual signal.")
     args = parser.parse_args()
 
     # Data
