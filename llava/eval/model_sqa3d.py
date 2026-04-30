@@ -155,113 +155,162 @@ def eval_model(questions, args):
         frame_sampling_strategy=args.frame_sampling_strategy,
     )
     
+    # Resume support: skip samples already in answer_file
+    already_done = set()
+    try:
+        with open(answer_file, "r") as _f:
+            for _line in _f:
+                try:
+                    already_done.add(json.loads(_line)["sample_id"])
+                except Exception:
+                    pass
+        if already_done:
+            print(f"[resume] {len(already_done)} samples already in {answer_file}, will skip them.")
+    except FileNotFoundError:
+        pass
+
     n_correct = 0
-    for line in tqdm(questions):
+    for _i, line in enumerate(tqdm(questions)):
         idx = line["id"]
-        question_type = line["metadata"]["question_type"]
-        dataset_name = line["metadata"]["dataset"]
-        video_id = line["video"]
+        if idx in already_done:
+            continue
+        # Periodic cache cleanup to avoid slow OOM accumulation over thousands of samples.
+        if _i and _i % 50 == 0:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-        gt = line["conversations"][1]["value"]
-        qs = line["conversations"][0]["value"]
-        cur_prompt = args.extra_prompt + qs
-        if model.config.mm_use_im_start_end:
-            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
-        else:
-            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+        try:
+            question_type = line["metadata"]["question_type"]
+            dataset_name = line["metadata"]["dataset"]
+            video_id = line["video"]
 
-        args.conv_mode = "qwen_1_5"
+            gt = line["conversations"][1]["value"]
+            qs = line["conversations"][0]["value"]
+            cur_prompt = args.extra_prompt + qs
+            if model.config.mm_use_im_start_end:
+                qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+            else:
+                qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
 
-        conv = conv_templates[args.conv_mode].copy()
-        conv.append_message(conv.roles[0], qs)
-        conv.append_message(conv.roles[1], None)
-        prompt = conv.get_prompt()
+            args.conv_mode = "qwen_1_5"
 
-        input_ids = preprocess_qwen([line["conversations"][0],{'from': 'gpt','value': None}], tokenizer, has_image=True).cuda()
-        img_num = list(input_ids.squeeze()).count(IMAGE_TOKEN_INDEX)
+            conv = conv_templates[args.conv_mode].copy()
+            conv.append_message(conv.roles[0], qs)
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
 
-        video_dict = video_processor.process_3d_video(
-            video_id,
-            image_processor,
-            force_sample=args.force_sample,
-            frames_upbound=args.max_frame_num,
-        )
+            input_ids = preprocess_qwen([line["conversations"][0],{'from': 'gpt','value': None}], tokenizer, has_image=True).cuda()
+            img_num = list(input_ids.squeeze()).count(IMAGE_TOKEN_INDEX)
 
-        if args.jepa_feature_folder is not None:
-            scene_id = video_id.split("/")[-1]
-            jepa_path = os.path.join(args.jepa_feature_folder, scene_id) + ".pt"
-            if os.path.exists(jepa_path):
-                jepa_data = torch.load(jepa_path, map_location="cpu")
-                if isinstance(jepa_data, dict):
-                    video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
-                    video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
-                elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
-                    video_dict["jepa_features"] = jepa_data[0]
-                    video_dict["jepa_coords"] = jepa_data[1]
-                else:
-                    raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
-            elif getattr(model.config, "use_jepa_only", False):
-                # JEPA-only mode has no fallback visual signal — record an empty prediction and skip.
-                print(f"[skip] JEPA-only run but JEPA features missing for {video_id} ({jepa_path}); writing empty prediction.")
-                with file_lock:
-                    ans_file.write(json.dumps({
-                        "dataset": dataset_name,
-                        "sample_id": idx,
-                        "prompt": cur_prompt,
-                        "pred_response": "",
-                        "gt_response": gt,
-                        "model_id": model_name,
-                        "question_type": question_type,
-                        "skipped_reason": "missing_jepa_feature",
-                    }) + "\n")
-                    ans_file.flush()
-                continue
-
-        video_dict = merge_video_dict([video_dict])
-        # Use model.dtype (bf16) instead of hard-coded fp16 to keep input/weights consistent.
-        image_tensors = video_dict.pop('images').to(dtype=model.dtype, device=model.device)
-        for k in video_dict:
-            video_dict[k] = video_dict[k].to(dtype=model.dtype, device=model.device)
-
-        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        keywords = [stop_str]
-        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-
-        with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids,
-                images=image_tensors,
-                modalities="video",
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                num_beams=args.num_beams,
-                # no_repeat_ngram_size=3,
-                max_new_tokens=512,
-                use_cache=True,
-                video_dict=video_dict,
+            video_dict = video_processor.process_3d_video(
+                video_id,
+                image_processor,
+                force_sample=args.force_sample,
+                frames_upbound=args.max_frame_num,
             )
 
-        
-        # NOTE: LlavaQwen.generate() calls super().generate(inputs_embeds=...)
-        # without input_ids. With inputs_embeds, HF generate returns ONLY the
-        # generated tokens (not input+generated), so no slicing needed.
-        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-        if outputs.endswith(stop_str):
-            outputs = outputs[:-len(stop_str)]
-        outputs = outputs.strip()
+            if args.jepa_feature_folder is not None:
+                scene_id = video_id.split("/")[-1]
+                jepa_path = os.path.join(args.jepa_feature_folder, scene_id) + ".pt"
+                if os.path.exists(jepa_path):
+                    jepa_data = torch.load(jepa_path, map_location="cpu")
+                    if isinstance(jepa_data, dict):
+                        video_dict["jepa_features"] = jepa_data.get("features", jepa_data.get("jepa_features"))
+                        video_dict["jepa_coords"] = jepa_data.get("coords", jepa_data.get("points"))
+                    elif isinstance(jepa_data, (tuple, list)) and len(jepa_data) >= 2:
+                        video_dict["jepa_features"] = jepa_data[0]
+                        video_dict["jepa_coords"] = jepa_data[1]
+                    else:
+                        raise ValueError(f"Unsupported JEPA feature format: {jepa_path}")
+                elif getattr(model.config, "use_jepa_only", False):
+                    # JEPA-only mode has no fallback visual signal — record an empty prediction and skip.
+                    print(f"[skip] JEPA-only run but JEPA features missing for {video_id} ({jepa_path}); writing empty prediction.")
+                    with file_lock:
+                        ans_file.write(json.dumps({
+                            "dataset": dataset_name,
+                            "sample_id": idx,
+                            "prompt": cur_prompt,
+                            "pred_response": "",
+                            "gt_response": gt,
+                            "model_id": model_name,
+                            "question_type": question_type,
+                            "skipped_reason": "missing_jepa_feature",
+                        }) + "\n")
+                        ans_file.flush()
+                    continue
 
-        with file_lock:
-            ans_file.write(json.dumps({
-                                    "dataset": dataset_name,
-                                    "sample_id": idx,
-                                    "prompt": cur_prompt,
-                                    "pred_response": outputs,
-                                    "gt_response": gt,
-                                    "model_id": model_name,
-                                    "question_type": question_type,
-                                    }) + "\n")
-            ans_file.flush()
+            video_dict = merge_video_dict([video_dict])
+            # Use model.dtype (bf16) instead of hard-coded fp16 to keep input/weights consistent.
+            image_tensors = video_dict.pop('images').to(dtype=model.dtype, device=model.device)
+            for k in video_dict:
+                video_dict[k] = video_dict[k].to(dtype=model.dtype, device=model.device)
+
+            stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+            keywords = [stop_str]
+            stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    input_ids,
+                    images=image_tensors,
+                    modalities="video",
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    # no_repeat_ngram_size=3,
+                    max_new_tokens=512,
+                    use_cache=True,
+                    video_dict=video_dict,
+                )
+
+            # NOTE: LlavaQwen.generate() calls super().generate(inputs_embeds=...)
+            # without input_ids. With inputs_embeds, HF generate returns ONLY the
+            # generated tokens (not input+generated), so no slicing needed.
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            if outputs.endswith(stop_str):
+                outputs = outputs[:-len(stop_str)]
+            outputs = outputs.strip()
+
+            with file_lock:
+                ans_file.write(json.dumps({
+                                        "dataset": dataset_name,
+                                        "sample_id": idx,
+                                        "prompt": cur_prompt,
+                                        "pred_response": outputs,
+                                        "gt_response": gt,
+                                        "model_id": model_name,
+                                        "question_type": question_type,
+                                        }) + "\n")
+                ans_file.flush()
+        except Exception as e:
+            # Don't let one bad sample kill the whole worker. Record an empty
+            # prediction so we can resume cleanly and inspect later.
+            import traceback
+            print(f"[error] sample {idx} (video={video_id if 'video_id' in dir() else line.get('video')}): {type(e).__name__}: {e}")
+            traceback.print_exc()
+            try:
+                with file_lock:
+                    ans_file.write(json.dumps({
+                        "dataset": line.get("metadata", {}).get("dataset"),
+                        "sample_id": idx,
+                        "prompt": line["conversations"][0].get("value", ""),
+                        "pred_response": "",
+                        "gt_response": line["conversations"][1].get("value", ""),
+                        "model_id": model_name,
+                        "question_type": line.get("metadata", {}).get("question_type"),
+                        "skipped_reason": f"{type(e).__name__}: {str(e)[:200]}",
+                    }) + "\n")
+                    ans_file.flush()
+            except Exception:
+                pass
+            # Best-effort recover from CUDA OOM
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     ans_file.close()
 
@@ -294,9 +343,10 @@ if __name__ == "__main__":
     with open(os.path.expanduser(args.question_file)) as f:
         questions = json.load(f)
 
+    # If answer file exists, allow resume (workers will skip already-done sample_ids).
     if os.path.exists(args.answer_file):
-        print(f"The {args.answer_file} already exists!!!")
-        exit()
+        n_done = sum(1 for _ in open(args.answer_file))
+        print(f"[resume] {args.answer_file} already exists with {n_done} lines; resuming.")
     
     ray.init()
     features = []
