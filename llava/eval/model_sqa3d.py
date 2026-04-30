@@ -245,6 +245,19 @@ def eval_model(questions, args):
             for k in video_dict:
                 video_dict[k] = video_dict[k].to(dtype=model.dtype, device=model.device)
 
+            # Diagnostic on first sample only: log JEPA shape + prompt length so we
+            # can spot truncation (visual tokens >> tokenizer.model_max_length would
+            # silently lop off the trailing assistant marker, producing generic
+            # captioning output that begins with "assistant ...").
+            if _i == 0:
+                _jf = video_dict.get("jepa_features")
+                _jc = video_dict.get("jepa_coords")
+                _max_len = getattr(model.config, "tokenizer_model_max_length", None)
+                print(f"[diag] input_ids len={input_ids.shape[1]}  "
+                      f"jepa_features shape={tuple(_jf.shape) if _jf is not None else None}  "
+                      f"jepa_coords shape={tuple(_jc.shape) if _jc is not None else None}  "
+                      f"tokenizer_model_max_length={_max_len}")
+
             stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
             keywords = [stop_str]
             stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
