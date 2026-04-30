@@ -123,7 +123,10 @@ def eval_model(questions, args):
         # Cast to model dtype so bf16-trained tensors land cleanly.
         state_dict = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in state_dict.items()}
         msg = model.load_state_dict(state_dict, strict=False)
-        critical_missing = [k for k in msg.missing_keys if any(s in k for s in ("jepa_projector", "world_position_embedding", "ground_head", "embed_tokens"))]
+        # embed_tokens is intentionally frozen during training (SQA3D never uses
+        # the new <coord>/<ground> tokens), so it lives in the base model's
+        # pretrained weights — not expected in non_lora_trainables.bin.
+        critical_missing = [k for k in msg.missing_keys if any(s in k for s in ("jepa_projector", "world_position_embedding", "ground_head"))]
         if msg.unexpected_keys:
             print(f"[non_lora_trainables] unexpected ({len(msg.unexpected_keys)}): {msg.unexpected_keys[:5]}{' ...' if len(msg.unexpected_keys) > 5 else ''}")
         if critical_missing:
@@ -240,14 +243,10 @@ def eval_model(questions, args):
             )
 
         
-        # HF generate() returns the full sequence (input + new tokens). Slice off the
-        # input prefix before decoding; otherwise skip_special_tokens leaves literal
-        # role text like "assistant\n" in the prediction (the chat-template tokens
-        # <|im_start|>/<|im_end|> are stripped, but "assistant" / "\n" are not).
-        input_token_len = input_ids.shape[1]
-        outputs = tokenizer.batch_decode(
-            output_ids[:, input_token_len:], skip_special_tokens=True
-        )[0].strip()
+        # NOTE: LlavaQwen.generate() calls super().generate(inputs_embeds=...)
+        # without input_ids. With inputs_embeds, HF generate returns ONLY the
+        # generated tokens (not input+generated), so no slicing needed.
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
         if outputs.endswith(stop_str):
             outputs = outputs[:-len(stop_str)]
         outputs = outputs.strip()
