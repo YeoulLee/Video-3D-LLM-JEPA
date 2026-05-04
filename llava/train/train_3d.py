@@ -2026,6 +2026,25 @@ def train(attn_implementation=None):
                     f"ground_head matches = {sum('ground_head' in n for n in _trainable_names)}; "
                     f"world_position_embedding matches = {sum('world_position_embedding' in n for n in _trainable_names)}; "
                     f"lora_ matches = {sum('lora_' in n for n in _trainable_names)}")
+
+        # FINAL zero-init pass on jepa_projector.out_proj.
+        # __init__-time zero-init can be silently undone by HF post_init,
+        # DeepSpeed Zero3 partition placeholders, or a late re-init pass.
+        # Applying it here — after PEFT wrap, pretrain load, dispatcher, and
+        # all init passes — guarantees the cold-start trick actually takes
+        # effect at training step 0. Skipped when --jepa_projector_pretrain
+        # provided a real path (we want trained values, not zeros).
+        if (model_args.use_jepa_only
+                and not (model_args.jepa_projector_pretrain
+                         and os.path.exists(model_args.jepa_projector_pretrain))):
+            zeroed = 0
+            for name, p in model.named_parameters():
+                if "jepa_projector" in name and "out_proj" in name:
+                    with torch.no_grad():
+                        p.zero_()
+                    zeroed += 1
+            rank0_print(f"[zero-init] jepa_projector.out_proj weight+bias zeroed ({zeroed} tensors). "
+                        f"Verify [JEPA-sanity] out_tokens abs_mean=0.0000 on first batch.")
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
