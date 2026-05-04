@@ -124,6 +124,8 @@ class ModelArguments:
     ground_head_temperature: Optional[float] = field(default=0.07)
 
     use_jepa_only: bool = field(default=False, metadata={"help": "If True, skip the SigLIP vision tower and feed pre-extracted 3D-JEPA features as the visual tokens via jepa_projector."})
+    projector_only_train: bool = field(default=False, metadata={"help": "Stage 1 mode: freeze the entire model except jepa_projector (and ground/world PE if applicable). Used to pretrain the projector before joint LoRA fine-tune, breaking the cold-start chicken-and-egg."})
+    jepa_projector_pretrain: Optional[str] = field(default=None, metadata={"help": "Path to a .bin file produced by Stage 1 (jepa_projector-only training). Loaded into model.jepa_projector at start of Stage 2 so LoRA training begins with a useful visual representation."})
 
 
 @dataclass
@@ -1714,6 +1716,32 @@ def train(attn_implementation=None):
                     "create the module BEFORE deepspeed.zero.Init() context."
                 )
 
+    # Stage 2: load pretrained jepa_projector weights from a Stage 1 checkpoint.
+    # Done BEFORE PEFT wrap so keys are raw "model.jepa_projector...".
+    if model_args.jepa_projector_pretrain is not None:
+        proj_state = torch.load(model_args.jepa_projector_pretrain, map_location="cpu")
+        # filter to jepa_projector only (defensive — Stage 1 should already save just these)
+        proj_state = {k: v for k, v in proj_state.items() if "jepa_projector" in k}
+        proj_state = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in proj_state.items()}
+        msg = model.load_state_dict(proj_state, strict=False)
+        if msg.unexpected_keys:
+            raise RuntimeError(
+                f"[stage2] jepa_projector pretrain has unexpected keys: {msg.unexpected_keys[:5]} "
+                f"(first 5 of {len(msg.unexpected_keys)}). Aborting to avoid silent zero-init."
+            )
+        rank0_print(f"[stage2] loaded jepa_projector pretrain from {model_args.jepa_projector_pretrain} "
+                    f"({len(proj_state)} tensors).")
+
+    # Stage 1: freeze the entire model. The post-dispatcher block below will
+    # selectively unfreeze jepa_projector (and world_position_embedding /
+    # ground_head if their conditions fire). This breaks the cold-start
+    # chicken-and-egg by giving the projector dedicated supervision before
+    # LoRA gets a chance to settle on a text-only solution.
+    if model_args.projector_only_train:
+        rank0_print("[stage1] projector_only_train=True; freezing entire model. "
+                    "Only jepa_projector + (world_position_embedding / ground_head if active) will train.")
+        model.requires_grad_(False)
+
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -2008,6 +2036,20 @@ def train(attn_implementation=None):
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+    # When use_jepa_only=True, also save jepa_projector-only weights as a small
+    # standalone .bin so the next stage (Stage 2 LoRA training) can load it via
+    # --jepa_projector_pretrain. Works for both LoRA and non-LoRA save paths.
+    if model_args.use_jepa_only and (training_args.local_rank == 0 or training_args.local_rank == -1):
+        # Strip PEFT prefix if present (LoRA case keeps the wrap until save).
+        proj_state = {}
+        for n, p in model.named_parameters():
+            if "jepa_projector" in n:
+                key = n[len("base_model.model."):] if n.startswith("base_model.model.") else n
+                proj_state[key] = p.detach().cpu()
+        if proj_state:
+            torch.save(proj_state, os.path.join(training_args.output_dir, "jepa_projector.bin"))
+            rank0_print(f"[save] jepa_projector.bin written ({len(proj_state)} tensors).")
 
     rank0_print(f"Model saved to {training_args.output_dir}")
 

@@ -1,37 +1,27 @@
 #!/bin/bash
 
-# Stage 2 of 2-stage training: full LoRA fine-tune with jepa_projector
-# initialized from Stage 1's pretrain (--jepa_projector_pretrain). LoRA
-# adapters now train on top of an already-useful visual representation,
-# avoiding the cold-start chicken-and-egg.
-#
-# Run Stage 1 first: scripts/3d/train/train_sqa3d_stage1_projector.sh
-# That writes ./ckpt/<stage1>/jepa_projector.bin which this shell loads.
+# Stage 1 of 2-stage training: pretrain jepa_projector ONLY.
+# Everything else (base LM, embed_tokens, lm_head, ...) is frozen.
+# Goal: break the cold-start chicken-and-egg where LoRA-only joint training
+# converges to a text-only solution before the projector ever produces a
+# useful visual representation. Output: ./ckpt/<run>/jepa_projector.bin
+# which Stage 2's --jepa_projector_pretrain consumes.
 
-# Set up the data folder
 IMAGE_FOLDER="data"
 VIDEO_FOLDER="data"
-DATA_YAML="scripts/3d/train/sqa3d.yaml"  # Update this path to your SQA3D training yaml
+DATA_YAML="scripts/3d/train/sqa3d.yaml"
 JEPA_FEATURE_FOLDER="data/3d-jepa-features"
 
-############### Prepare Envs #################
-# python3 -m pip install flash-attn --no-build-isolation
 alias python=python3
-############### Show Envs ####################
 
 nvidia-smi
 
-################ SQA3D LoRA JEPA-only Training ################
-
 LLM_VERSION="Qwen/Qwen2-7B-Instruct"
-LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
 VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
-VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
 PROMPT_VERSION="qwen_1_5"
-MID_RUN_NAME="llavanext-qwen-video3dllm-sqa3d-lora-jepaonly"
+MID_RUN_NAME="llavanext-qwen-video3dllm-sqa3d-jepaonly-stage1"
 PREV_STAGE_CHECKPOINT="data/models/LLaVA-Video-7B-Qwen2"
-STAGE1_CKPT="./ckpt/llavanext-qwen-video3dllm-sqa3d-jepaonly-stage1"  # produced by train_sqa3d_stage1_projector.sh
 
 NUM_GPUS=8
 BATCH_SIZE=16
@@ -50,11 +40,7 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --jepa_feature_folder $JEPA_FEATURE_FOLDER \
     --jepa_max_tokens 4096 \
     --use_jepa_only True \
-    --jepa_projector_pretrain ${STAGE1_CKPT}/jepa_projector.bin \
-    --lora_enable True \
-    --lora_r 128 \
-    --lora_alpha 256 \
-    --lora_dropout 0.05 \
+    --projector_only_train True \
     --vision_tower ${VISION_MODEL_VERSION} \
     --mm_projector_type mlp2x_gelu \
     --mm_vision_select_layer -2 \
@@ -66,16 +52,15 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --bf16 True \
     --run_name $MID_RUN_NAME \
     --output_dir ./ckpt/$MID_RUN_NAME \
-    --num_train_epochs 3 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps 500 \
-    --save_total_limit 3 \
-    --learning_rate 1e-4 \
-    --jepa_projector_lr 1e-3 \
+    --save_total_limit 2 \
+    --learning_rate 1e-3 \
     --weight_decay 0. \
     --warmup_ratio 0.05 \
     --lr_scheduler_type "cosine" \
@@ -85,8 +70,6 @@ torchrun --nnodes=1 --nproc_per_node="${NUM_GPUS}" --master_port 43000 \
     --gradient_checkpointing True \
     --dataloader_num_workers 1 \
     --lazy_preprocess True \
-    --torch_compile True \
-    --torch_compile_backend "inductor" \
     --dataloader_drop_last True \
     --mm_newline_position grid \
     --add_spatial_instruction True \
