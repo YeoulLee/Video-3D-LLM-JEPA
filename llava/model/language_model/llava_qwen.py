@@ -213,6 +213,15 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # CRITICAL: post_init() above calls HF's _init_weights on every Linear,
+        # including the out_proj inside our aggregator that we zero-initialized
+        # in _JEPAProjectorInline.__init__. That re-initialization (normal
+        # distribution) silently breaks the cold-start trick. Re-apply zero-init
+        # AFTER post_init so it actually sticks.
+        if _use_jepa and hasattr(self.model, "jepa_projector") and hasattr(self.model.jepa_projector, "out_proj"):
+            nn.init.zeros_(self.model.jepa_projector.out_proj.weight)
+            nn.init.zeros_(self.model.jepa_projector.out_proj.bias)
+
     def get_model(self):
         return self.model
 
