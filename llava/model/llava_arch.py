@@ -477,32 +477,35 @@ class LlavaMetaForCausalLM(ABC):
             jepa_coords = video_dict["jepa_coords"]        # (B, N, 3)
 
             target_dtype = projector.point_proj[0].weight.dtype
-            projected = projector(jepa_features.to(target_dtype))   # (B, N, hidden)
 
-            # One-shot sanity check on first batch: dead inputs (all-zero / NaN)
-            # would let training run silently with no visual signal. Print stats
-            # once, then disable.
-            if not getattr(self, "_jepa_sanity_logged", False):
-                with torch.no_grad():
-                    f = jepa_features.float()
-                    p = projected.float()
-                    print(f"[JEPA-sanity] features shape={tuple(jepa_features.shape)} "
-                          f"abs_mean={f.abs().mean().item():.4g} std={f.std().item():.4g} "
-                          f"any_nan={torch.isnan(f).any().item()}  ||  "
-                          f"projected abs_mean={p.abs().mean().item():.4g} std={p.std().item():.4g} "
-                          f"any_nan={torch.isnan(p).any().item()}")
-                self._jepa_sanity_logged = True
-
+            # Compute per-point positional embeddings (if configured) and feed
+            # them into the aggregator's input stage so cross-attention sees
+            # spatially-aware point features. Old MLP-projector added PE to
+            # per-point projector OUTPUT, but the aggregator output has shape
+            # (B, N_query, H) which doesn't align with (B, N_points, H) PE.
+            coord_pe = None
             if wpe_module is not None:
-                # Re-use the same sin3d coord encoder as the SigLIP path so the spatial
-                # representation stays consistent. Discretize coordinates first if the
-                # model was trained with a 'discrete' world_position_embedding_type.
                 wpe_type = getattr(self.config, "world_position_embedding_type", "")
                 if "discrete" in wpe_type:
                     coords_for_pe = self.discrete_coords(jepa_coords.float(), None)
                 else:
                     coords_for_pe = jepa_coords.float()
-                projected = projected + wpe_module(coords_for_pe.detach()).to(target_dtype)
+                coord_pe = wpe_module(coords_for_pe.detach()).to(target_dtype)
+
+            projected = projector(jepa_features.to(target_dtype), coord_pe=coord_pe)   # (B, N_query, hidden)
+
+            # One-shot sanity check on first batch.
+            if not getattr(self, "_jepa_sanity_logged", False):
+                with torch.no_grad():
+                    f = jepa_features.float()
+                    p = projected.float()
+                    print(f"[JEPA-sanity] in_features shape={tuple(jepa_features.shape)} "
+                          f"abs_mean={f.abs().mean().item():.4g} std={f.std().item():.4g} "
+                          f"any_nan={torch.isnan(f).any().item()}  ||  "
+                          f"out_tokens shape={tuple(projected.shape)} "
+                          f"abs_mean={p.abs().mean().item():.4g} std={p.std().item():.4g} "
+                          f"any_nan={torch.isnan(p).any().item()}")
+                self._jepa_sanity_logged = True
 
             image_features = [projected[b] for b in range(projected.shape[0])]
         else:

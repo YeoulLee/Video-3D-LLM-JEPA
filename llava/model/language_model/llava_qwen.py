@@ -65,26 +65,88 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             # models in llava.model.__init__ can leave llava_arch partially
             # loaded when their import chain fails).
             import torch.nn as _nn
+            import torch as _torch
+
             class _JEPAProjectorInline(_nn.Module):
-                def __init__(self, hidden_size, point_dim=256):
+                """Point-to-token aggregator (Q-Former / Perceiver style).
+
+                Why aggregator instead of per-point MLP:
+                  * The base LM was pretrained on patch-level SigLIP tokens
+                    (~5800 rich tokens with 2D-spatial structure). Feeding
+                    raw per-point JEPA features (4096 thin tokens) to the LM
+                    produces a granularity mismatch — its learned attention
+                    patterns expect patch-like tokens, not isolated points.
+                  * N learnable query tokens cross-attend to the projected
+                    points, producing N "patch-like" output tokens. This
+                    reduces token count and packs richer info per token,
+                    closer to what the LM expects.
+
+                The output's last linear is zero-initialized so the module
+                outputs 0 at training step 0 (cold-start trick): LoRA starts
+                from a clean text-only state and the aggregator has to climb
+                up from zero, avoiding the noise-ignored deadlock.
+                """
+
+                def __init__(self, hidden_size, point_dim=256, num_query_tokens=256, num_layers=2, num_heads=8):
                     super().__init__()
+                    self.num_query_tokens = num_query_tokens
+                    # Project per-point features into LM hidden space.
                     self.point_proj = _nn.Sequential(
                         _nn.LayerNorm(point_dim),
                         _nn.Linear(point_dim, hidden_size),
-                        _nn.GELU(),
-                        _nn.Linear(hidden_size, hidden_size),
                     )
-                    # Zero-init the last Linear so the projector outputs 0 at the
-                    # very start of training. This breaks the cold-start deadlock
-                    # where LoRA learns to ignore visual tokens before the
-                    # projector ever converges to useful representations: with
-                    # zero output the LM behaves text-only at step 0, and the
-                    # projector then has to climb up from 0 — gradient flows
-                    # cleanly without LoRA having pre-decided to ignore noise.
-                    _nn.init.zeros_(self.point_proj[3].weight)
-                    _nn.init.zeros_(self.point_proj[3].bias)
-                def forward(self, x):
-                    return self.point_proj(x)
+                    # Learnable queries — these become the visual tokens.
+                    self.query_tokens = _nn.Parameter(_torch.randn(num_query_tokens, hidden_size) * 0.02)
+                    # Stack of (cross-attention, self-attention, FFN) blocks.
+                    self.cross_attn_layers = _nn.ModuleList([
+                        _nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+                        for _ in range(num_layers)
+                    ])
+                    self.self_attn_layers = _nn.ModuleList([
+                        _nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+                        for _ in range(num_layers)
+                    ])
+                    self.ffn_layers = _nn.ModuleList([
+                        _nn.Sequential(
+                            _nn.Linear(hidden_size, hidden_size * 4),
+                            _nn.GELU(),
+                            _nn.Linear(hidden_size * 4, hidden_size),
+                        )
+                        for _ in range(num_layers)
+                    ])
+                    self.norms_ca = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    self.norms_sa = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    self.norms_ffn = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    # Final output projection — zero-init for cold-start (see class docstring).
+                    self.out_proj = _nn.Linear(hidden_size, hidden_size)
+                    _nn.init.zeros_(self.out_proj.weight)
+                    _nn.init.zeros_(self.out_proj.bias)
+
+                def forward(self, x, coord_pe=None):
+                    # x: (B, N_points, point_dim)
+                    # coord_pe (optional): (B, N_points, H) precomputed positional
+                    # embeddings from the world_position_embedding module — added
+                    # to per-point representations BEFORE cross-attention so the
+                    # learnable queries can attend with spatial awareness.
+                    keys = self.point_proj(x)  # (B, N_points, H)
+                    if coord_pe is not None:
+                        keys = keys + coord_pe.to(keys.dtype)
+                    B = keys.size(0)
+                    q = self.query_tokens.unsqueeze(0).expand(B, -1, -1)  # (B, N_q, H)
+                    for ca, sa, ffn, n_ca, n_sa, n_ffn in zip(
+                        self.cross_attn_layers, self.self_attn_layers, self.ffn_layers,
+                        self.norms_ca, self.norms_sa, self.norms_ffn,
+                    ):
+                        # Cross-attention: queries attend to projected points.
+                        attn_out, _ = ca(n_ca(q), keys, keys, need_weights=False)
+                        q = q + attn_out
+                        # Self-attention among queries.
+                        attn_out, _ = sa(n_sa(q), n_sa(q), n_sa(q), need_weights=False)
+                        q = q + attn_out
+                        # FFN.
+                        q = q + ffn(n_ffn(q))
+                    return self.out_proj(q)  # (B, N_q, H)
+
             self.model.jepa_projector = _JEPAProjectorInline(config.hidden_size)
             # Sanity verify the params actually registered on self.model
             jepa_param_names = [n for n, _ in self.model.named_parameters() if "jepa_projector" in n]

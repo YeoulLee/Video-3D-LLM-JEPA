@@ -1685,23 +1685,58 @@ def train(attn_implementation=None):
             # (which leaves llava.model.llava_arch in a partially-initialized
             # state, breaking later `from ... import JEPAProjector`).
             import torch.nn as _nn
+            # Mirror of the Q-Former-style aggregator in llava_qwen.py — see
+            # there for full rationale. This backup path runs only when the
+            # __init__ creation didn't fire (rare DeepSpeed edge case).
+            import torch as _torch_local
             class _JEPAProjectorInline(_nn.Module):
-                def __init__(self, hidden_size, point_dim=256):
+                def __init__(self, hidden_size, point_dim=256, num_query_tokens=256, num_layers=2, num_heads=8):
                     super().__init__()
+                    self.num_query_tokens = num_query_tokens
                     self.point_proj = _nn.Sequential(
                         _nn.LayerNorm(point_dim),
                         _nn.Linear(point_dim, hidden_size),
-                        _nn.GELU(),
-                        _nn.Linear(hidden_size, hidden_size),
                     )
-                    # Zero-init last Linear — see llava_qwen.py for full rationale.
-                    # Mirrored here because this is the train-time backup path
-                    # used when LlavaQwenForCausalLM.__init__ didn't create the
-                    # projector (rare DeepSpeed edge case).
-                    _nn.init.zeros_(self.point_proj[3].weight)
-                    _nn.init.zeros_(self.point_proj[3].bias)
-                def forward(self, x):
-                    return self.point_proj(x)
+                    self.query_tokens = _nn.Parameter(_torch_local.randn(num_query_tokens, hidden_size) * 0.02)
+                    self.cross_attn_layers = _nn.ModuleList([
+                        _nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+                        for _ in range(num_layers)
+                    ])
+                    self.self_attn_layers = _nn.ModuleList([
+                        _nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+                        for _ in range(num_layers)
+                    ])
+                    self.ffn_layers = _nn.ModuleList([
+                        _nn.Sequential(
+                            _nn.Linear(hidden_size, hidden_size * 4),
+                            _nn.GELU(),
+                            _nn.Linear(hidden_size * 4, hidden_size),
+                        )
+                        for _ in range(num_layers)
+                    ])
+                    self.norms_ca = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    self.norms_sa = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    self.norms_ffn = _nn.ModuleList([_nn.LayerNorm(hidden_size) for _ in range(num_layers)])
+                    self.out_proj = _nn.Linear(hidden_size, hidden_size)
+                    _nn.init.zeros_(self.out_proj.weight)
+                    _nn.init.zeros_(self.out_proj.bias)
+
+                def forward(self, x, coord_pe=None):
+                    keys = self.point_proj(x)
+                    if coord_pe is not None:
+                        keys = keys + coord_pe.to(keys.dtype)
+                    B = keys.size(0)
+                    q = self.query_tokens.unsqueeze(0).expand(B, -1, -1)
+                    for ca, sa, ffn, n_ca, n_sa, n_ffn in zip(
+                        self.cross_attn_layers, self.self_attn_layers, self.ffn_layers,
+                        self.norms_ca, self.norms_sa, self.norms_ffn,
+                    ):
+                        attn_out, _ = ca(n_ca(q), keys, keys, need_weights=False)
+                        q = q + attn_out
+                        attn_out, _ = sa(n_sa(q), n_sa(q), n_sa(q), need_weights=False)
+                        q = q + attn_out
+                        q = q + ffn(n_ffn(q))
+                    return self.out_proj(q)
             inner = model.get_model()  # the LlavaQwenModel
             inner.jepa_projector = _JEPAProjectorInline(model.config.hidden_size)
             # match dtype / device of an existing param so it lands on the right rank
@@ -1718,19 +1753,25 @@ def train(attn_implementation=None):
 
     # Stage 2: load pretrained jepa_projector weights from a Stage 1 checkpoint.
     # Done BEFORE PEFT wrap so keys are raw "model.jepa_projector...".
+    # Path is optional — if the file doesn't exist, fall back to zero-init.
+    # This lets the same shell drive both single-stage runs (no pretrain) and
+    # 2-stage runs (pretrain exists) without commenting/uncommenting args.
     if model_args.jepa_projector_pretrain is not None:
-        proj_state = torch.load(model_args.jepa_projector_pretrain, map_location="cpu")
-        # filter to jepa_projector only (defensive — Stage 1 should already save just these)
-        proj_state = {k: v for k, v in proj_state.items() if "jepa_projector" in k}
-        proj_state = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in proj_state.items()}
-        msg = model.load_state_dict(proj_state, strict=False)
-        if msg.unexpected_keys:
-            raise RuntimeError(
-                f"[stage2] jepa_projector pretrain has unexpected keys: {msg.unexpected_keys[:5]} "
-                f"(first 5 of {len(msg.unexpected_keys)}). Aborting to avoid silent zero-init."
-            )
-        rank0_print(f"[stage2] loaded jepa_projector pretrain from {model_args.jepa_projector_pretrain} "
-                    f"({len(proj_state)} tensors).")
+        if os.path.exists(model_args.jepa_projector_pretrain):
+            proj_state = torch.load(model_args.jepa_projector_pretrain, map_location="cpu")
+            proj_state = {k: v for k, v in proj_state.items() if "jepa_projector" in k}
+            proj_state = {k: (v.to(model.dtype) if torch.is_floating_point(v) else v) for k, v in proj_state.items()}
+            msg = model.load_state_dict(proj_state, strict=False)
+            if msg.unexpected_keys:
+                raise RuntimeError(
+                    f"[stage2] jepa_projector pretrain has unexpected keys: {msg.unexpected_keys[:5]} "
+                    f"(first 5 of {len(msg.unexpected_keys)}). Aborting to avoid silent zero-init."
+                )
+            rank0_print(f"[stage2] loaded jepa_projector pretrain from {model_args.jepa_projector_pretrain} "
+                        f"({len(proj_state)} tensors).")
+        else:
+            rank0_print(f"[stage2] jepa_projector_pretrain={model_args.jepa_projector_pretrain} "
+                        f"does not exist; proceeding with zero-init (single-stage mode).")
 
     # Stage 1: freeze the entire model. The post-dispatcher block below will
     # selectively unfreeze jepa_projector (and world_position_embedding /
